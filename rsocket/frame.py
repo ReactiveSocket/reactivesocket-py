@@ -180,6 +180,8 @@ class SetupFrame(Frame):
         self.minor_version = PROTOCOL_MINOR_VERSION
         self.flags_lease = False
         self.flags_resume = False
+        self.keep_alive_milliseconds = 30000
+        self.max_lifetime_milliseconds = 120000
 
     # noinspection PyAttributeOutsideInit
     def parse(self, buffer, offset):
@@ -269,24 +271,28 @@ class LeaseFrame(Frame):
 
 
 class KeepAliveFrame(Frame):
-    __slots__ = 'flags_respond'
+    __slots__ = ('flags_respond', "last_receive_position")
 
     _FLAG_RESPOND_BIT = 0x80
 
     def __init__(self):
         super().__init__(Type.KEEPALIVE)
         self.flags_respond = False
+        self.last_receive_position = 0
 
     # noinspection PyAttributeOutsideInit
     def parse(self, buffer, offset):
         offset += self.parse_header(buffer, offset)
         self.flags_respond = (self.flags & self._FLAG_RESPOND_BIT) != 0
+        self.last_receive_position = struct.unpack_from('>Q', buffer, offset)[0]
+        offset += 8
         offset += self.parse_data(buffer, offset)
 
     def serialize(self, middle=b''):
         self.flags &= ~self._FLAG_RESPOND_BIT
         if self.flags_respond:
             self.flags |= self._FLAG_RESPOND_BIT
+        middle = struct.pack('>Q', self.last_receive_position)
         return Frame.serialize(self, middle)
 
 
@@ -438,7 +444,7 @@ class PayloadFrame(Frame):
             self.flags |= self._FLAG_FOLLOWS_BIT
         if self.flags_complete:
             self.flags |= self._FLAG_COMPLETE_BIT
-        if self.flags_next:
+        if self.flags_next or self.data or self.metadata:
             self.flags |= self._FLAG_NEXT_BIT
         return Frame.serialize(self)
 

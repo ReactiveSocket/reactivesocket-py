@@ -1,5 +1,7 @@
 import asyncio
 from abc import ABCMeta, abstractmethod
+from rsocket.timer import IntervalTimer
+
 
 from rsocket.connection import Connection
 from rsocket.frame import CancelFrame, ErrorFrame, KeepAliveFrame, \
@@ -64,7 +66,9 @@ class BaseRequestHandler(RequestHandler):
 
 class RSocket:
     def __init__(self, reader, writer, *,
-                 handler_factory=BaseRequestHandler, loop=None, server=True):
+                 handler_factory=BaseRequestHandler, loop=None, server=True,
+                 data_encoding =b'utf-8', metadata_encoding=b'utf-8',
+                 setup_payload=None):
         self._reader = reader
         self._writer = writer
         self._server = server
@@ -82,16 +86,26 @@ class RSocket:
             setup.flags_lease = False
             setup.flags_strict = True
 
-            setup.keep_alive_milliseconds = 60000
-            setup.max_lifetime_milliseconds = 240000
+            setup.keep_alive_milliseconds = 30000
+            setup.max_lifetime_milliseconds = 120000
+            # setup frame: data encoding, metadata encoding, setup payload
+            setup.data_encoding = data_encoding
+            setup.metadata_encoding = metadata_encoding
+            if setup_payload:
+                setup.data = setup_payload.data
+                setup.metadata = setup_payload.metadata
 
-            setup.data_encoding = b'utf-8'
-            setup.metadata_encoding = b'utf-8'
             self.send_frame(setup)
+            self.keep_alive_timer = IntervalTimer(setup.keep_alive_milliseconds/1000, self.send_keep_alive)
 
         self._receiver_task = loop.create_task(self._receiver())
         self._sender_task = loop.create_task(self._sender())
         self._error = ErrorFrame()
+
+    async def send_keep_alive(self):
+        keep_alive_frame = KeepAliveFrame()
+        keep_alive_frame.flags_respond = True
+        self.send_frame_directly(keep_alive_frame)
 
     def allocate_stream(self):
         stream = self._next_stream
@@ -105,6 +119,9 @@ class RSocket:
 
     def send_frame(self, frame):
         self._send_queue.put_nowait(frame)
+
+    def send_frame_directly(self, frame):
+        self._writer.write(frame.serialize())
 
     async def send_error(self, stream, exception):
         error = ErrorFrame()
@@ -140,8 +157,9 @@ class RSocket:
                     elif isinstance(frame, ErrorFrame):
                         pass
                     elif isinstance(frame, KeepAliveFrame):
-                        frame.flags_respond = False
-                        self.send_frame(frame)
+                        if frame.flags_respond:
+                            frame.flags_respond = False
+                            self.send_frame_directly(frame)
                     elif isinstance(frame, LeaseFrame):
                         pass
                     elif isinstance(frame, MetadataPushFrame):
@@ -149,12 +167,15 @@ class RSocket:
                     elif isinstance(frame, RequestChannelFrame):
                         pass
                     elif isinstance(frame, RequestFireAndForgetFrame):
-                        pass
+                        asyncio.get_event_loop().run_in_executor(None, self._handler.request_fire_and_forget, Payload(frame.data, frame.metadata))
                     elif isinstance(frame, RequestResponseFrame):
                         stream = frame.stream_id
-                        self._streams[stream] = RequestResponseResponder(
-                            stream, self, self._handler.request_response(
-                                Payload(frame.data, frame.metadata)))
+                        response_handler = self._handler.request_response
+                        if asyncio.iscoroutinefunction(response_handler):
+                            future_result = await response_handler(Payload(frame.data, frame.metadata))
+                        else:
+                            future_result = response_handler(Payload(frame.data, frame.metadata))
+                        self._streams[stream] = RequestResponseResponder(stream, self, future_result)
                     elif isinstance(frame, RequestStreamFrame):
                         stream = frame.stream_id
                         self._streams[stream] = RequestStreamResponder(
@@ -183,6 +204,13 @@ class RSocket:
         except asyncio.CancelledError:
             pass
 
+    def fire_and_forget(self, payload):
+        frame = RequestFireAndForgetFrame()
+        frame.stream_id = self.allocate_stream()
+        frame.metadata = payload.metadata
+        frame.data = payload.data
+        self.send_frame(frame)
+
     def request_response(self, payload):
         stream = self.allocate_stream()
         requester = RequestResponseRequester(stream, self, payload)
@@ -204,5 +232,6 @@ class RSocket:
     async def close(self):
         self._sender_task.cancel()
         self._receiver_task.cancel()
+        self.keep_alive_timer.cancel()
         await self._sender_task
         await self._receiver_task
